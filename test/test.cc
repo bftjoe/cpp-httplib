@@ -58,6 +58,14 @@ TEST(StartupTest, WSAStartup) {
 }
 #endif
 
+TEST(DecodeURLTest, PercentCharacter) {
+  EXPECT_EQ(
+      detail::decode_url(
+          R"(descrip=Gastos%20%C3%A1%C3%A9%C3%AD%C3%B3%C3%BA%C3%B1%C3%91%206)",
+          false),
+      R"(descrip=Gastos áéíóúñÑ 6)");
+}
+
 TEST(EncodeQueryParamTest, ParseUnescapedChararactersTest) {
   string unescapedCharacters = "-_.!~*'()";
 
@@ -392,6 +400,31 @@ TEST(ChunkedEncodingTest, FromHTTPWatch_Online) {
   EXPECT_EQ(200, res->status);
   EXPECT_EQ(out, res->body);
 }
+
+TEST(HostnameToIPConversionTest, HTTPWatch_Online) {
+  auto host = "www.httpwatch.com";
+
+  auto ip = hosted_at(host);
+  EXPECT_EQ("191.236.16.12", ip);
+
+  std::vector<std::string> addrs;
+  hosted_at(host, addrs);
+  EXPECT_EQ(1u, addrs.size());
+}
+
+#if 0 // It depends on each test environment...
+TEST(HostnameToIPConversionTest, YouTube_Online) {
+  auto host = "www.youtube.com";
+
+  std::vector<std::string> addrs;
+  hosted_at(host, addrs);
+
+  EXPECT_EQ(20u, addrs.size());
+
+  auto it = std::find(addrs.begin(), addrs.end(), "2607:f8b0:4006:809::200e");
+  EXPECT_TRUE(it != addrs.end());
+}
+#endif
 
 TEST(ChunkedEncodingTest, WithContentReceiver_Online) {
   auto host = "www.httpwatch.com";
@@ -750,7 +783,7 @@ TEST(SpecifyServerIPAddressTest, AnotherHostname_Online) {
   auto host = "google.com";
   auto another_host = "example.com";
   auto wrong_ip = "0.0.0.0";
-  
+
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
   SSLClient cli(host);
 #else
@@ -766,7 +799,7 @@ TEST(SpecifyServerIPAddressTest, AnotherHostname_Online) {
 TEST(SpecifyServerIPAddressTest, RealHostname_Online) {
   auto host = "google.com";
   auto wrong_ip = "0.0.0.0";
-  
+
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
   SSLClient cli(host);
 #else
@@ -1195,12 +1228,13 @@ TEST(ErrorHandlerTest, ContentLength) {
 TEST(ExceptionHandlerTest, ContentLength) {
   Server svr;
 
-  svr.set_exception_handler(
-      [](const Request & /*req*/, Response &res, std::exception & /*e*/) {
-        res.status = 500;
-        res.set_content("abcdefghijklmnopqrstuvwxyz",
-                        "text/html"); // <= Content-Length still 13
-      });
+  svr.set_exception_handler([](const Request & /*req*/, Response &res,
+                               std::exception &e) {
+    EXPECT_EQ("abc", std::string(e.what()));
+    res.status = 500;
+    res.set_content("abcdefghijklmnopqrstuvwxyz",
+                    "text/html"); // <= Content-Length still 13 at this point
+  });
 
   svr.Get("/hi", [](const Request & /*req*/, Response &res) {
     res.set_content("Hello World!\n", "text/plain");
@@ -1212,15 +1246,28 @@ TEST(ExceptionHandlerTest, ContentLength) {
   // Give GET time to get a few messages.
   std::this_thread::sleep_for(std::chrono::seconds(1));
 
-  {
+  for (size_t i = 0; i < 10; i++) {
     Client cli(HOST, PORT);
 
-    auto res = cli.Get("/hi");
-    ASSERT_TRUE(res);
-    EXPECT_EQ(500, res->status);
-    EXPECT_EQ("text/html", res->get_header_value("Content-Type"));
-    EXPECT_EQ("26", res->get_header_value("Content-Length"));
-    EXPECT_EQ("abcdefghijklmnopqrstuvwxyz", res->body);
+    for (size_t j = 0; j < 100; j++) {
+      auto res = cli.Get("/hi");
+      ASSERT_TRUE(res);
+      EXPECT_EQ(500, res->status);
+      EXPECT_EQ("text/html", res->get_header_value("Content-Type"));
+      EXPECT_EQ("26", res->get_header_value("Content-Length"));
+      EXPECT_EQ("abcdefghijklmnopqrstuvwxyz", res->body);
+    }
+
+    cli.set_keep_alive(true);
+
+    for (size_t j = 0; j < 100; j++) {
+      auto res = cli.Get("/hi");
+      ASSERT_TRUE(res);
+      EXPECT_EQ(500, res->status);
+      EXPECT_EQ("text/html", res->get_header_value("Content-Type"));
+      EXPECT_EQ("26", res->get_header_value("Content-Length"));
+      EXPECT_EQ("abcdefghijklmnopqrstuvwxyz", res->body);
+    }
   }
 
   svr.stop();
@@ -1616,6 +1663,11 @@ protected:
                 EXPECT_EQ("0", req.get_header_value("Content-Length"));
                 res.set_content("empty-no-content-type", "text/plain");
               })
+        .Post("/post-large",
+             [&](const Request &req, Response &res) {
+               EXPECT_EQ(req.body, LARGE_DATA);
+               res.set_content(req.body, "text/plain");
+             })
         .Put("/empty-no-content-type",
              [&](const Request &req, Response &res) {
                EXPECT_EQ(req.body, "");
@@ -2019,6 +2071,13 @@ TEST_F(ServerTest, PostEmptyContentWithNoContentType) {
   ASSERT_TRUE(res);
   ASSERT_EQ(200, res->status);
   ASSERT_EQ("empty-no-content-type", res->body);
+}
+
+TEST_F(ServerTest, PostLarge) {
+  auto res = cli_.Post("/post-large", LARGE_DATA, "text/plain");
+  ASSERT_TRUE(res);
+  ASSERT_EQ(200, res->status);
+  EXPECT_EQ(LARGE_DATA, res->body);
 }
 
 TEST_F(ServerTest, PutEmptyContentWithNoContentType) {
@@ -3625,10 +3684,11 @@ TEST(StreamingTest, NoContentLengthStreaming) {
 
   auto get_thread = std::thread([&client]() {
     std::string s;
-    auto res = client.Get("/stream", [&s](const char *data, size_t len) -> bool {
-      s += std::string(data, len);
-      return true;
-    });
+    auto res =
+        client.Get("/stream", [&s](const char *data, size_t len) -> bool {
+          s += std::string(data, len);
+          return true;
+        });
     EXPECT_EQ("aaabbb", s);
   });
 
@@ -3754,6 +3814,36 @@ TEST(KeepAliveTest, ReadTimeout) {
   svr.stop();
   listen_thread.join();
   ASSERT_FALSE(svr.is_running());
+}
+
+TEST(KeepAliveTest, Issue1041) {
+  const auto resourcePath = "/hi";
+
+  Server svr;
+  svr.set_keep_alive_timeout(3);
+
+  svr.Get(resourcePath, [](const httplib::Request &, httplib::Response &res) {
+    res.set_content("Hello World!", "text/plain");
+  });
+
+  auto a2 = std::async(std::launch::async, [&svr] { svr.listen(HOST, PORT); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  Client cli(HOST, PORT);
+  cli.set_keep_alive(true);
+
+  auto result = cli.Get(resourcePath);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(200, result->status);
+
+  std::this_thread::sleep_for(std::chrono::seconds(5));
+
+  result = cli.Get(resourcePath);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(200, result->status);
+
+  svr.stop();
+  a2.wait();
 }
 
 TEST(ClientProblemDetectionTest, ContentProvider) {
